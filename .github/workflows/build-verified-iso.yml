@@ -1,0 +1,108 @@
+name: Build verified macOS ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos_version:
+        description: macOS family (latest non-beta installer offered by Apple)
+        type: choice
+        default: Tahoe
+        required: true
+        options:
+          - Tahoe
+          - Sequoia
+          - Sonoma
+          - Ventura
+          - Monterey
+          - Big Sur
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      SOURCE_REVISION: edc6b03018848f3ff6d5d27c1e9bf8432ad06754
+      MACOS_FAMILY: ${{ inputs.macos_version }}
+    steps:
+      - name: Check out reviewed upstream source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: LongQT-sea/macos-iso-builder
+          ref: edc6b03018848f3ff6d5d27c1e9bf8432ad06754
+          path: builder
+          persist-credentials: false
+      - name: Build using unmodified reviewed mkmaciso
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$(git -C builder rev-parse HEAD)" = "$SOURCE_REVISION"
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          softwareupdate --list-full-installers > "$GITHUB_WORKSPACE/output/apple-installer-catalog.txt"
+          cd builder
+          ./mkmaciso "$MACOS_FAMILY" iso "$GITHUB_WORKSPACE/output/macOS.iso" 2>&1 | tee "$GITHUB_WORKSPACE/output/build.log"
+      - name: Verify image metadata and generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/output"
+          shopt -s nullglob
+          images=(*.iso)
+          test "${#images[@]}" -eq 1
+          iso="${images[0]}"
+          export ISO_NAME="$iso"
+          export VERIFY_MOUNT="$RUNNER_TEMP/verified-installer"
+          mkdir -p "$VERIFY_MOUNT"
+          hdiutil attach -readonly -nobrowse -mountpoint "$VERIFY_MOUNT" "$iso"
+          trap 'hdiutil detach "$VERIFY_MOUNT" || true' EXIT
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, pathlib, plistlib
+          root = pathlib.Path(os.environ['VERIFY_MOUNT'])
+          plist_path = root / 'System/Library/CoreServices/SystemVersion.plist'
+          with plist_path.open('rb') as stream:
+              system = plistlib.load(stream)
+          version = system['ProductVersion']
+          build = system['ProductBuildVersion']
+          expected = {'Tahoe': '26', 'Sequoia': '15', 'Sonoma': '14', 'Ventura': '13', 'Monterey': '12', 'Big Sur': '11'}[os.environ['MACOS_FAMILY']]
+          if version.split('.')[0] != expected:
+              raise SystemExit(f'Installer family mismatch: {version} versus {expected}')
+          iso = pathlib.Path(os.environ['ISO_NAME'])
+          digest256, digest512 = hashlib.sha256(), hashlib.sha512()
+          with iso.open('rb') as stream:
+              while block := stream.read(8 * 1024 * 1024):
+                  digest256.update(block)
+                  digest512.update(block)
+          script = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'builder/mkmaciso'
+          manifest = {
+              'schema': 1, 'family': os.environ['MACOS_FAMILY'],
+              'product_version': version, 'product_build': build,
+              'iso_name': iso.name, 'size_bytes': iso.stat().st_size,
+              'sha256': digest256.hexdigest(), 'sha512': digest512.hexdigest(),
+              'source_repository': 'https://github.com/LongQT-sea/macos-iso-builder',
+              'source_revision': os.environ['SOURCE_REVISION'],
+              'builder_sha256': hashlib.sha256(script.read_bytes()).hexdigest(),
+              'workflow_revision': os.environ['GITHUB_SHA'],
+              'run_url': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'runner_architecture': 'x86_64',
+              'metadata_source': 'System/Library/CoreServices/SystemVersion.plist in read-only mounted output ISO',
+              'created_utc': datetime.datetime.now(datetime.timezone.utc).isoformat()
+          }
+          pathlib.Path('build-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          pathlib.Path('SHA256SUMS').write_text(f'{manifest["sha256"]}  {iso.name}\n')
+          pathlib.Path('SHA512SUMS').write_text(f'{manifest["sha512"]}  {iso.name}\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'Built macOS {version} ({build}) from reviewed source {manifest["source_revision"]}.\n\n')
+              summary.write(f'ISO: `{iso.name}`\n\nSHA-256: `{manifest["sha256"]}`\n')
+          print(json.dumps(manifest, indent=2))
+          PY
+      - name: Upload ISO and verification records
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: macOS-${{ inputs.macos_version }}-verified-ISO-${{ github.run_id }}
+          path: output/
+          compression-level: 0
+          retention-days: 15
+          if-no-files-found: error
